@@ -40,14 +40,18 @@ def generate_ai_recommendations(
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+    except Exception as error:
+        return _format_openai_error(error)
+
     text = _extract_text(response)
     return text or "AI response was empty."
 
@@ -80,14 +84,18 @@ def generate_improved_text_variants(
         f"{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
     )
 
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.4,
-    )
+    try:
+        response = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+        )
+    except Exception as error:
+        return _format_openai_error(error)
+
     text = _extract_text(response)
     return text or "AI text generation returned empty output."
 
@@ -111,3 +119,27 @@ def _extract_text(response: Any) -> str:
                 if text:
                     chunks.append(text.strip())
     return "\n\n".join(chunks).strip()
+
+
+def _format_openai_error(error: Exception) -> str:
+    error_name = error.__class__.__name__
+    text = str(error).strip()
+
+    if "RateLimitError" in error_name or "rate limit" in text.lower():
+        return (
+            "Лимит OpenAI API достигнут. Проверьте квоту/баланс в OpenAI, "
+            "подождите немного и повторите запрос."
+        )
+    if "AuthenticationError" in error_name or "invalid_api_key" in text.lower():
+        return (
+            "Ошибка авторизации OpenAI API. Проверьте корректность OPENAI_API_KEY "
+            "в Secrets."
+        )
+    if "PermissionDeniedError" in error_name:
+        return "Доступ к выбранной модели запрещен для текущего API-ключа."
+    if "APITimeoutError" in error_name or "timeout" in text.lower():
+        return "OpenAI API не ответил вовремя. Повторите попытку позже."
+    if "APIConnectionError" in error_name or "connection" in text.lower():
+        return "Не удалось подключиться к OpenAI API. Проверьте сеть и повторите."
+
+    return f"Ошибка OpenAI API: {error_name}. {text}"
