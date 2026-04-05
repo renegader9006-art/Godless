@@ -126,12 +126,43 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     lines = [
-        "SEO Отчет",
+        "SEO Отчет (Полноценный Контент-Аудит)",
         f"Источник: {result.source}",
         f"Оценка: {result.score}/100",
         "",
-        "Метрики:",
+        "Примечание: оценка является эвристикой и используется для приоритизации задач.",
+        "",
     ]
+    high_count = sum(1 for issue in result.issues if issue.priority == "HIGH")
+    medium_count = sum(1 for issue in result.issues if issue.priority == "MEDIUM")
+    low_count = sum(1 for issue in result.issues if issue.priority == "LOW")
+    lines.extend(
+        [
+            "Executive Summary:",
+            f"- Критично: {high_count}",
+            f"- Важно: {medium_count}",
+            f"- Желательно: {low_count}",
+            "",
+            "Топ-3 приоритетных шага:",
+        ]
+    )
+    sorted_issues = sorted(
+        result.issues,
+        key=lambda issue: {"HIGH": 0, "MEDIUM": 1, "LOW": 2}.get(issue.priority, 9),
+    )
+    top_steps = [issue.recommendation for issue in sorted_issues[:3]]
+    if top_steps:
+        for index, step in enumerate(top_steps, start=1):
+            lines.append(f"- {index}. {step}")
+    else:
+        lines.append("- 1. Поддерживайте текущий уровень качества контента.")
+
+    lines.extend(
+        [
+            "",
+        "Метрики:",
+        ]
+    )
     for key, value in result.metrics.items():
         lines.append(f"- {key}: {value}")
 
@@ -140,7 +171,7 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
     if result.issues:
         for issue in result.issues:
             lines.append(
-                f"- [{issue.priority}] {issue.title}: {issue.recommendation}"
+                f"- [{issue.priority}] ({issue.category}) {issue.title}: {issue.recommendation}"
             )
     else:
         lines.append("- Критичных проблем не найдено.")

@@ -7,6 +7,7 @@ from typing import Any
 @dataclass(slots=True)
 class SEOIssue:
     priority: str
+    category: str
     title: str
     recommendation: str
     penalty: int

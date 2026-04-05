@@ -2,3 +2,4 @@ beautifulsoup4>=4.12.3
 requests>=2.32.3
 openai>=1.68.0
 streamlit>=1.44.0
+reportlab>=4.2.2

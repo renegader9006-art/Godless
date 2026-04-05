@@ -3,18 +3,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import requests
+
 from .models import AnalysisResult
 
 
 def generate_ai_recommendations(
     result: AnalysisResult, api_key: str, model: str
 ) -> str | None:
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return "OpenAI package is not installed. Run: pip install openai"
-
-    client = OpenAI(api_key=api_key)
     payload = {
         "source": result.source,
         "score": result.score,
@@ -22,6 +18,7 @@ def generate_ai_recommendations(
         "issues": [
             {
                 "priority": issue.priority,
+                "category": issue.category,
                 "title": issue.title,
                 "recommendation": issue.recommendation,
             }
@@ -31,15 +28,99 @@ def generate_ai_recommendations(
     }
 
     system_prompt = (
-        "Ты SEO-стратег. Дай приоритетные и практические рекомендации. "
-        "Отвечай на русском языке в markdown с разделами: "
-        "'Быстрые улучшения', 'Стратегические улучшения', 'Примеры переписывания'."
+        "Ты SEO-стратег. Дай приоритетные практические рекомендации на русском языке. "
+        "Формат: markdown с разделами 'Быстрые улучшения', "
+        "'Стратегические улучшения', 'Примеры переписывания'."
     )
     user_prompt = (
-        "Проанализируй SEO-отчет и дай практические рекомендации:\n\n"
+        "Проанализируй SEO-отчет и дай конкретные рекомендации:\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
+    return _openai_chat(system_prompt, user_prompt, api_key=api_key, model=model)
 
+
+def generate_improved_text_variants(
+    source_text: str,
+    issues_summary: list[str],
+    keywords: list[str],
+    api_key: str,
+    model: str,
+) -> str:
+    prompt_payload = {
+        "keywords": keywords,
+        "issues": issues_summary,
+        "text_preview": source_text[:7000],
+    }
+    system_prompt = (
+        "Ты SEO-копирайтер. Улучши текст под интент и читаемость. "
+        "Верни markdown строго с двумя блоками: 'Вариант A' и 'Вариант B'."
+    )
+    user_prompt = (
+        "Перепиши текст, сохрани смысл и факты. Сделай лучше по SEO:\n\n"
+        f"{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
+    )
+    return _openai_chat(system_prompt, user_prompt, api_key=api_key, model=model)
+
+
+def generate_ai_recommendations_ollama(
+    result: AnalysisResult,
+    model: str,
+    base_url: str = "http://127.0.0.1:11434",
+) -> str:
+    payload = {
+        "source": result.source,
+        "score": result.score,
+        "metrics": result.metrics,
+        "issues": [
+            {
+                "priority": issue.priority,
+                "category": issue.category,
+                "title": issue.title,
+                "recommendation": issue.recommendation,
+            }
+            for issue in result.issues
+        ],
+        "keyword_stats": result.keyword_stats,
+    }
+    prompt = (
+        "Ты SEO-стратег. Дай рекомендации на русском языке.\n"
+        "Формат: markdown с разделами 'Быстрые улучшения', "
+        "'Стратегические улучшения', 'Примеры переписывания'.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+    return _ollama_generate(prompt=prompt, model=model, base_url=base_url)
+
+
+def generate_improved_text_variants_ollama(
+    source_text: str,
+    issues_summary: list[str],
+    keywords: list[str],
+    model: str,
+    base_url: str = "http://127.0.0.1:11434",
+) -> str:
+    payload = {
+        "keywords": keywords,
+        "issues": issues_summary,
+        "text_preview": source_text[:7000],
+    }
+    prompt = (
+        "Ты SEO-копирайтер. Улучши текст на русском языке.\n"
+        "Верни markdown строго с двумя блоками: 'Вариант A' и 'Вариант B'.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+    return _ollama_generate(prompt=prompt, model=model, base_url=base_url)
+
+
+def _openai_chat(system_prompt: str, user_prompt: str, api_key: str, model: str) -> str:
+    try:
+        from openai import OpenAI
+    except ImportError:
+        return "Пакет openai не установлен. Выполните: pip install openai"
+
+    if not api_key.strip():
+        return "Не найден OpenAI API-ключ."
+
+    client = OpenAI(api_key=api_key)
     try:
         response = client.responses.create(
             model=model,
@@ -53,51 +134,31 @@ def generate_ai_recommendations(
         return _format_openai_error(error)
 
     text = _extract_text(response)
-    return text or "AI response was empty."
+    return text or "AI-ответ пустой."
 
 
-def generate_improved_text_variants(
-    source_text: str,
-    issues_summary: list[str],
-    keywords: list[str],
-    api_key: str,
-    model: str,
-) -> str:
+def _ollama_generate(prompt: str, model: str, base_url: str) -> str:
+    url = f"{base_url.rstrip('/')}/api/generate"
     try:
-        from openai import OpenAI
-    except ImportError:
-        return "OpenAI package is not installed. Run: pip install openai"
-
-    client = OpenAI(api_key=api_key)
-    prompt_payload = {
-        "keywords": keywords,
-        "issues": issues_summary,
-        "text_preview": source_text[:6000],
-    }
-    system_prompt = (
-        "Ты SEO-копирайтер. Улучши статью под поисковый интент, читаемость "
-        "и уместное использование ключевых слов. Отвечай на русском языке. "
-        "Верни markdown строго с двумя вариантами: 'Вариант A' и 'Вариант B'."
-    )
-    user_prompt = (
-        "Перепиши статью, сохрани факты и смысл. Улучши структуру и SEO-качество.\n\n"
-        f"{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
-    )
-
-    try:
-        response = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.4,
+        response = requests.post(
+            url,
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=180,
         )
-    except Exception as error:
-        return _format_openai_error(error)
+        response.raise_for_status()
+    except requests.exceptions.ConnectionError:
+        return (
+            "Не удалось подключиться к Ollama. "
+            "Проверьте, что Ollama запущен локально и доступен на 127.0.0.1:11434."
+        )
+    except requests.exceptions.RequestException as error:
+        return f"Ошибка Ollama API: {error}"
 
-    text = _extract_text(response)
-    return text or "AI text generation returned empty output."
+    payload = response.json()
+    text = (payload.get("response") or "").strip()
+    if not text:
+        return "Ollama вернул пустой ответ."
+    return text
 
 
 def _extract_text(response: Any) -> str:
@@ -127,19 +188,16 @@ def _format_openai_error(error: Exception) -> str:
 
     if "RateLimitError" in error_name or "rate limit" in text.lower():
         return (
-            "Лимит OpenAI API достигнут. Проверьте квоту/баланс в OpenAI, "
-            "подождите немного и повторите запрос."
+            "Лимит OpenAI API достигнут. Проверьте квоту/баланс, "
+            "подождите и повторите запрос."
         )
     if "AuthenticationError" in error_name or "invalid_api_key" in text.lower():
-        return (
-            "Ошибка авторизации OpenAI API. Проверьте корректность OPENAI_API_KEY "
-            "в Secrets."
-        )
+        return "Ошибка авторизации OpenAI API. Проверьте OPENAI_API_KEY."
     if "PermissionDeniedError" in error_name:
-        return "Доступ к выбранной модели запрещен для текущего API-ключа."
+        return "Нет доступа к выбранной модели OpenAI."
     if "APITimeoutError" in error_name or "timeout" in text.lower():
-        return "OpenAI API не ответил вовремя. Повторите попытку позже."
+        return "OpenAI API не ответил вовремя. Попробуйте позже."
     if "APIConnectionError" in error_name or "connection" in text.lower():
-        return "Не удалось подключиться к OpenAI API. Проверьте сеть и повторите."
+        return "Не удалось подключиться к OpenAI API. Проверьте сеть."
 
     return f"Ошибка OpenAI API: {error_name}. {text}"
