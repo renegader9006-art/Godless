@@ -17,42 +17,42 @@ from .models import AnalysisResult
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="seo-ai-analyzer",
-        description="Анализируйте контент и получайте SEO-рекомендации.",
+        description="CLI-инструмент для базового SEO-аудита HTML/URL.",
     )
     target_group = parser.add_mutually_exclusive_group(required=True)
     target_group.add_argument("--url", help="URL страницы для анализа.")
-    target_group.add_argument("--file", help="Путь к локальному HTML-файлу.")
+    target_group.add_argument("--file", help="Локальный путь к HTML-файлу.")
 
     parser.add_argument(
         "--keyword",
         action="append",
         default=[],
-        help="Целевое ключевое слово. Можно передать несколько раз.",
+        help="Ключевая фраза для проверки вхождений. Можно указывать несколько раз.",
     )
     parser.add_argument(
         "--format",
         choices=("text", "json"),
         default="text",
-        help="Формат вывода.",
+        help="Формат отчета.",
     )
     parser.add_argument(
         "--output",
-        help="Необязательный путь для сохранения отчета.",
+        help="Путь для сохранения отчета.",
     )
     parser.add_argument(
         "--use-ai",
         action="store_true",
-        help="Сгенерировать дополнительные AI-рекомендации через OpenAI API.",
+        help="Добавить AI-рекомендации через OpenAI API.",
     )
     parser.add_argument(
         "--model",
         default="gpt-4.1-mini",
-        help="Название модели OpenAI для AI-рекомендаций.",
+        help="Модель OpenAI для AI-блока.",
     )
     parser.add_argument(
         "--api-key",
         default="",
-        help="OpenAI API-ключ (необязательно, если задан OPENAI_API_KEY).",
+        help="OpenAI API key (или переменная OPENAI_API_KEY).",
     )
     return parser
 
@@ -65,25 +65,25 @@ def run(argv: list[str] | None = None) -> int:
         source, html = _load_source(args.url, args.file)
     except requests.exceptions.ProxyError as error:
         print(
-            "Ошибка сети: прокси настроен некорректно. "
-            "Проверьте HTTP_PROXY/HTTPS_PROXY или отключите прокси для этого запуска.",
+            "Ошибка сети: прокси-сервер недоступен или неверно настроен. "
+            "Проверьте HTTP_PROXY/HTTPS_PROXY и повторите.",
             file=sys.stderr,
         )
         print(f"Детали: {error}", file=sys.stderr)
         return 2
     except requests.exceptions.SSLError as error:
         print(
-            "Ошибка сети: не удалось проверить SSL-сертификат. "
-            "Проверьте системные корневые сертификаты или настройки HTTPS-инспекции.",
+            "Ошибка SSL: не удалось проверить сертификат HTTPS-страницы. "
+            "Проверьте сертификаты системы и сетевое окружение.",
             file=sys.stderr,
         )
         print(f"Детали: {error}", file=sys.stderr)
         return 2
     except requests.exceptions.RequestException as error:
-        print(f"Ошибка сети: {error}", file=sys.stderr)
+        print(f"Ошибка HTTP-запроса: {error}", file=sys.stderr)
         return 2
     except OSError as error:
-        print(f"Ошибка ввода-вывода: {error}", file=sys.stderr)
+        print(f"Ошибка чтения файла: {error}", file=sys.stderr)
         return 2
 
     result = analyze_html(source=source, html=html, keywords=args.keyword or None)
@@ -92,12 +92,14 @@ def run(argv: list[str] | None = None) -> int:
         api_key = args.api_key or os.getenv("OPENAI_API_KEY", "")
         if not api_key:
             result.ai_recommendations = (
-                "Запрошен AI-режим, но API-ключ отсутствует. "
-                "Используйте --api-key или задайте OPENAI_API_KEY."
+                "AI-блок отключен: не найден OpenAI API key. "
+                "Передайте --api-key или задайте OPENAI_API_KEY."
             )
         else:
             result.ai_recommendations = generate_ai_recommendations(
-                result=result, api_key=api_key, model=args.model
+                result=result,
+                api_key=api_key,
+                model=args.model,
             )
 
     rendered = render_report(result, output_format=args.format)
@@ -116,7 +118,7 @@ def _load_source(url: str | None, file_path: str | None) -> tuple[str, str]:
         return url, load_html_from_url(url)
     if file_path:
         return file_path, load_html_from_file(file_path)
-    raise ValueError("Нужно передать --url или --file.")
+    raise ValueError("Необходимо указать --url или --file.")
 
 
 def render_report(result: AnalysisResult, output_format: str) -> str:
@@ -126,11 +128,11 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     lines = [
-        "SEO Отчет (Полноценный Контент-Аудит)",
+        "SEO-аудит (эвристический отчет)",
         f"Источник: {result.source}",
         f"Оценка: {result.score}/100",
         "",
-        "Примечание: оценка является эвристикой и используется для приоритизации задач.",
+        "Примечание: оценка носит ориентировочный характер и нужна для приоритизации задач.",
         "",
     ]
     high_count = sum(1 for issue in result.issues if issue.priority == "HIGH")
@@ -138,12 +140,12 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
     low_count = sum(1 for issue in result.issues if issue.priority == "LOW")
     lines.extend(
         [
-            "Executive Summary:",
+            "Сводка:",
             f"- Критично: {high_count}",
             f"- Важно: {medium_count}",
             f"- Желательно: {low_count}",
             "",
-            "Топ-3 приоритетных шага:",
+            "Топ-3 действия:",
         ]
     )
     sorted_issues = sorted(
@@ -155,12 +157,12 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
         for index, step in enumerate(top_steps, start=1):
             lines.append(f"- {index}. {step}")
     else:
-        lines.append("- 1. Поддерживайте текущий уровень качества контента.")
+        lines.append("- 1. Критичных проблем не обнаружено.")
 
     lines.extend(
         [
             "",
-        "Метрики:",
+            "Метрики:",
         ]
     )
     for key, value in result.metrics.items():
@@ -174,7 +176,7 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
                 f"- [{issue.priority}] ({issue.category}) {issue.title}: {issue.recommendation}"
             )
     else:
-        lines.append("- Критичных проблем не найдено.")
+        lines.append("- Проблем не найдено.")
 
     lines.append("")
     lines.append("Плотность ключевых слов (%):")
@@ -182,7 +184,7 @@ def render_report(result: AnalysisResult, output_format: str) -> str:
         for key, value in result.keyword_stats.items():
             lines.append(f"- {key}: {value}")
     else:
-        lines.append("- Недостаточно текста для расчета плотности ключевых слов.")
+        lines.append("- Ключевые слова не заданы.")
 
     if result.ai_recommendations:
         lines.append("")

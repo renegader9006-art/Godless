@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import certifi
 import requests
 
 
@@ -19,6 +20,16 @@ def load_html_from_url(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
             url,
             timeout=timeout,
             headers=headers,
+        )
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.SSLError:
+        # Retry with explicit CA bundle if OS certificate store is broken.
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers=headers,
+            verify=certifi.where(),
         )
         response.raise_for_status()
         return response.text
