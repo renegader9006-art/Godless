@@ -4,7 +4,7 @@ import html
 import json
 import os
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
@@ -22,10 +22,13 @@ from seo_ai_analyzer.analyzer import analyze_html, analyze_text_article
 from seo_ai_analyzer.auth import (
     authenticate_user,
     change_user_password,
+    create_persistent_login_token,
     get_user_profile,
     init_auth_db,
     register_user,
+    resolve_persistent_login_token,
     resolve_login_username,
+    revoke_persistent_login_token,
     update_user_email,
 )
 from seo_ai_analyzer.billing import (
@@ -52,6 +55,13 @@ from seo_ai_analyzer.billing import (
 from seo_ai_analyzer.competitive import benchmark_against_competitors, discover_competitors
 from seo_ai_analyzer.fetcher import load_html_from_url
 from seo_ai_analyzer.history import build_alerts, build_changelog, load_previous_snapshot, save_snapshot
+from seo_ai_analyzer.integrations import (
+    fetch_ga4_api_data,
+    fetch_gsc_api_data,
+    fetch_pagespeed_data,
+    parse_ga4_csv,
+    parse_gsc_csv,
+)
 from seo_ai_analyzer.models import AnalysisResult
 from seo_ai_analyzer.query_audit import audit_queries
 from seo_ai_analyzer.reporting import build_one_page_report, markdown_to_pdf_bytes
@@ -194,6 +204,9 @@ def _show_profile_notice() -> None:
 
 
 def init_session_state() -> None:
+    today = datetime.utcnow().date()
+    default_start = (today - timedelta(days=28)).isoformat()
+    default_end = today.isoformat()
     defaults = {
         "analysis_result": None,
         "analysis_text": "",
@@ -211,6 +224,7 @@ def init_session_state() -> None:
         "ai_variants": "",
         "is_authenticated": False,
         "auth_user": "",
+        "remember_me_login": True,
         "nav_page": "Дашборд",
         "page_menu": "Дашборд",
         "url_input_value": "",
@@ -230,6 +244,18 @@ def init_session_state() -> None:
         "config_ollama_model": "qwen2.5:7b",
         "config_ollama_base_url": "http://127.0.0.1:11434",
         "config_openai_api_key": "",
+        "config_pagespeed_api_key": "",
+        "config_pagespeed_strategy": "mobile",
+        "config_google_service_account_json": "",
+        "config_gsc_site_url": "",
+        "config_ga4_property_id": "",
+        "config_google_start_date": default_start,
+        "config_google_end_date": default_end,
+        "integration_pagespeed_data": {},
+        "integration_gsc_data": {},
+        "integration_ga4_data": {},
+        "integration_gsc_api_data": {},
+        "integration_ga4_api_data": {},
         "profile_notice": None,
         "prepared_export_md": False,
         "prepared_export_json": False,
@@ -416,6 +442,10 @@ def inject_ui_styles() -> None:
             background:rgba(255,255,255,.92);
             padding:14px;
             box-shadow:0 8px 24px rgba(58,54,110,.08);
+            display:flex;
+            flex-direction:column;
+            min-height:740px;
+            height:100%;
         }
         .plan-card-highlight{
             border-color:rgba(122,108,255,.52);
@@ -437,6 +467,9 @@ def inject_ui_styles() -> None:
         .plan-price{font-size:1.6rem;font-weight:700;line-height:1.1;margin:4px 0 2px 0;}
         .plan-period{font-size:.8rem;color:var(--muted);margin-bottom:8px;}
         .plan-tagline{font-size:.84rem;color:#334155;line-height:1.45;margin-bottom:10px;}
+        .plan-copy{min-height:150px;}
+        .plan-features{min-height:190px;}
+        .plan-limits{margin-top:auto;}
         .plan-feature{font-size:.84rem;color:#0f172a;line-height:1.5;margin:4px 0;}
         .plan-muted{font-size:.78rem;color:var(--muted);line-height:1.45;margin-top:8px;}
         .status-title{font-size:.9rem;font-weight:600;margin:0 0 4px 0;color:#0f172a;}
@@ -961,6 +994,13 @@ def _settings() -> dict[str, object]:
         "ollama_model": st.session_state["config_ollama_model"],
         "ollama_base_url": st.session_state["config_ollama_base_url"],
         "openai_key": st.session_state["config_openai_api_key"] or os.getenv("OPENAI_API_KEY", ""),
+        "pagespeed_api_key": st.session_state["config_pagespeed_api_key"],
+        "pagespeed_strategy": st.session_state["config_pagespeed_strategy"],
+        "google_service_account_json": st.session_state["config_google_service_account_json"],
+        "gsc_site_url": st.session_state["config_gsc_site_url"],
+        "ga4_property_id": st.session_state["config_ga4_property_id"],
+        "google_start_date": st.session_state["config_google_start_date"],
+        "google_end_date": st.session_state["config_google_end_date"],
     }
 
 
@@ -986,6 +1026,120 @@ def _send_webhook(webhook_url: str, payload: dict) -> tuple[bool, str]:
         return True, "Webhook отправлен."
     except requests.exceptions.RequestException as error:
         return False, f"Ошибка отправки webhook: {error}"
+
+
+def _query_param_value(name: str) -> str:
+    raw = st.query_params.get(name, "")
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    return str(raw or "").strip()
+
+
+def _set_query_param(name: str, value: str) -> None:
+    st.query_params[name] = value
+
+
+def _delete_query_param(name: str) -> None:
+    if name in st.query_params:
+        del st.query_params[name]
+
+
+def _restore_auth_from_persistent_token() -> None:
+    if _is_authenticated():
+        return
+    token = _query_param_value("auth")
+    if not token:
+        return
+    username = resolve_persistent_login_token(token)
+    if username:
+        st.session_state["is_authenticated"] = True
+        st.session_state["auth_user"] = username
+    else:
+        _delete_query_param("auth")
+
+
+def _refresh_uploaded_integrations_state() -> None:
+    gsc_file = st.session_state.get("config_gsc_csv")
+    ga4_file = st.session_state.get("config_ga4_csv")
+
+    if gsc_file is not None:
+        try:
+            st.session_state["integration_gsc_data"] = parse_gsc_csv(gsc_file.getvalue())
+        except Exception as error:  # noqa: BLE001
+            st.session_state["integration_gsc_data"] = {"ok": False, "error": f"GSC import error: {error}"}
+    else:
+        st.session_state["integration_gsc_data"] = {}
+
+    if ga4_file is not None:
+        try:
+            st.session_state["integration_ga4_data"] = parse_ga4_csv(ga4_file.getvalue())
+        except Exception as error:  # noqa: BLE001
+            st.session_state["integration_ga4_data"] = {"ok": False, "error": f"GA4 import error: {error}"}
+    else:
+        st.session_state["integration_ga4_data"] = {}
+
+
+def _refresh_pagespeed_state(url: str, settings: dict[str, object]) -> None:
+    if not url.startswith(("http://", "https://")):
+        st.session_state["integration_pagespeed_data"] = {}
+        return
+
+    api_key = str(settings.get("pagespeed_api_key", "")).strip()
+    if not api_key:
+        st.session_state["integration_pagespeed_data"] = {}
+        return
+
+    strategy = str(settings.get("pagespeed_strategy", "mobile")).strip() or "mobile"
+    st.session_state["integration_pagespeed_data"] = fetch_pagespeed_data(url, api_key, strategy=strategy)
+
+
+def _refresh_google_api_integrations_state(settings: dict[str, object]) -> None:
+    sa_json = str(settings.get("google_service_account_json", "")).strip()
+    start_date = str(settings.get("google_start_date", "")).strip()
+    end_date = str(settings.get("google_end_date", "")).strip()
+    gsc_site_url = str(settings.get("gsc_site_url", "")).strip()
+    ga4_property_id = str(settings.get("ga4_property_id", "")).strip()
+
+    if not sa_json:
+        st.session_state["integration_gsc_api_data"] = {}
+        st.session_state["integration_ga4_api_data"] = {}
+        return
+
+    if gsc_site_url:
+        st.session_state["integration_gsc_api_data"] = fetch_gsc_api_data(
+            service_account_json=sa_json,
+            site_url=gsc_site_url,
+            start_date=start_date,
+            end_date=end_date,
+            row_limit=100,
+        )
+    else:
+        st.session_state["integration_gsc_api_data"] = {}
+
+    if ga4_property_id:
+        st.session_state["integration_ga4_api_data"] = fetch_ga4_api_data(
+            service_account_json=sa_json,
+            property_id=ga4_property_id,
+            start_date=start_date,
+            end_date=end_date,
+            row_limit=100,
+        )
+    else:
+        st.session_state["integration_ga4_api_data"] = {}
+
+
+def _attach_integrations_to_action_pack() -> None:
+    action_pack = st.session_state.get("action_pack")
+    if not isinstance(action_pack, dict):
+        return
+    action_pack["integrations"] = {
+        "pagespeed": st.session_state.get("integration_pagespeed_data", {}),
+        "gsc_csv": st.session_state.get("integration_gsc_data", {}),
+        "ga4_csv": st.session_state.get("integration_ga4_data", {}),
+        "gsc_api": st.session_state.get("integration_gsc_api_data", {}),
+        "ga4_api": st.session_state.get("integration_ga4_api_data", {}),
+    }
+    st.session_state["action_pack"] = action_pack
 
 
 def _current_user() -> str:
@@ -1074,6 +1228,7 @@ def _save_analysis_result(
     st.session_state["one_page_report_md"] = build_one_page_report(result, brand_name=str(settings["brand"]))
     st.session_state["ai_recommendations"] = ""
     st.session_state["ai_variants"] = ""
+    _attach_integrations_to_action_pack()
     _reset_export_flags()
 
 
@@ -1116,7 +1271,15 @@ def _run_competitor_benchmark(result: AnalysisResult, source_url: str, settings:
 
 
 def build_markdown_report(result: AnalysisResult) -> str:
-    lines = ["# SEO-отчет", "", f"- Источник: {result.source}", f"- Оценка: {result.score}/100", "", "## Проблемы"]
+    lines = [
+        "# SEO-отчет",
+        "",
+        f"- Источник: {result.source}",
+        f"- Эвристический индекс SEO-качества: {result.score}/100",
+        "- Важно: индекс является модельной оценкой для приоритизации задач, а не абсолютной истиной.",
+        "",
+        "## Проблемы",
+    ]
     issues = sorted_issues(result)
     if not issues:
         lines.append("- Критичных проблем не найдено.")
@@ -1124,6 +1287,15 @@ def build_markdown_report(result: AnalysisResult) -> str:
         for issue in issues:
             priority_label = PRIORITY_LABELS.get(issue.priority, issue.priority)
             lines.append(f"- **{priority_label} / {issue.category}**: {issue.title}. {issue.recommendation}")
+    lines.append("")
+    lines.append("## Доказательность")
+    lines.append(f"- Indexability status: {result.metrics.get('indexability_status', 'n/a')}")
+    lines.append(f"- Intent coverage: {result.metrics.get('intent_coverage_pct', 'n/a')}%")
+    lines.append(f"- CTA status: {result.metrics.get('cta_status', 'n/a')}")
+    lines.append(
+        "- Рекомендация: сверяйте выводы с внешними источниками (GSC/GA4/PageSpeed), "
+        "если принимается бизнес-решение."
+    )
     lines.append("")
     lines.append("## Метрики")
     for key, value in result.metrics.items():
@@ -1352,7 +1524,7 @@ def render_auth_gate() -> bool:
         with st.form("login_form"):
             username = st.text_input("\u041b\u043e\u0433\u0438\u043d \u0438\u043b\u0438 e-mail", placeholder="\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043b\u043e\u0433\u0438\u043d \u0438\u043b\u0438 e-mail")
             password = st.text_input("\u041f\u0430\u0440\u043e\u043b\u044c", type="password", placeholder="\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043f\u0430\u0440\u043e\u043b\u044c")
-            st.checkbox("\u0417\u0430\u043f\u043e\u043c\u043d\u0438\u0442\u044c \u043c\u0435\u043d\u044f", key="remember_me_login")
+            remember_me = st.checkbox("\u0417\u0430\u043f\u043e\u043c\u043d\u0438\u0442\u044c \u043c\u0435\u043d\u044f", key="remember_me_login", value=True)
             submit = st.form_submit_button("\u0412\u043e\u0439\u0442\u0438", type="primary", use_container_width=True)
         st.markdown('<div class="auth-links"><span></span><a class="link" href="#">\u0417\u0430\u0431\u044b\u043b\u0438 \u043f\u0430\u0440\u043e\u043b\u044c?</a></div>', unsafe_allow_html=True)
         if submit:
@@ -1361,6 +1533,15 @@ def render_auth_gate() -> bool:
                 resolved_username = resolve_login_username(username) or username.strip()
                 st.session_state["is_authenticated"] = True
                 st.session_state["auth_user"] = resolved_username
+                if remember_me:
+                    token = create_persistent_login_token(resolved_username)
+                    if token:
+                        _set_query_param("auth", token)
+                else:
+                    old_token = _query_param_value("auth")
+                    if old_token:
+                        revoke_persistent_login_token(old_token)
+                    _delete_query_param("auth")
                 st.rerun()
             else:
                 st.error(message)
@@ -1381,8 +1562,12 @@ def render_auth_gate() -> bool:
             else:
                 ok, message = register_user(username=username, password=password)
                 if ok:
+                    resolved_username = resolve_login_username(username) or username.strip()
                     st.session_state["is_authenticated"] = True
-                    st.session_state["auth_user"] = username.strip()
+                    st.session_state["auth_user"] = resolved_username
+                    token = create_persistent_login_token(resolved_username)
+                    if token:
+                        _set_query_param("auth", token)
                     st.rerun()
                 else:
                     st.error(message)
@@ -1403,6 +1588,10 @@ def render_sidebar() -> None:
         st.radio("Меню", MENU_PAGES, key="page_menu", format_func=_page_label, on_change=_on_menu_change)
         st.divider()
         if st.button("Выйти", use_container_width=True, key="sidebar_logout_btn"):
+            old_token = _query_param_value("auth")
+            if old_token:
+                revoke_persistent_login_token(old_token)
+            _delete_query_param("auth")
             st.session_state["is_authenticated"] = False
             st.session_state["auth_user"] = ""
             st.session_state["nav_page"] = DASHBOARD_PAGE
@@ -1561,14 +1750,92 @@ def render_settings_page() -> None:
             st.text_input("Ollama URL", key="config_ollama_base_url")
         else:
             st.caption("AI отключен. Выберите OpenAI или Ollama, чтобы включить AI-функции.")
+
+    st.divider()
+    st.subheader("Интеграции и внешние данные")
+    ext_left, ext_right = st.columns(2)
+    with ext_left:
+        st.text_input("PageSpeed API key", type="password", key="config_pagespeed_api_key")
+        st.selectbox("PageSpeed стратегия", ["mobile", "desktop"], key="config_pagespeed_strategy")
+    with ext_right:
+        st.caption(
+            "Подключите реальный performance-сигнал через Google PageSpeed API. "
+            "Это усиливает доказательность отчета."
+        )
+        st.caption("Для GSC/GA4 доступны 2 режима: прямой API (Service Account) или импорт CSV.")
+
+    st.markdown("**Google API (прямое подключение)**")
+    api_left, api_right = st.columns(2)
+    with api_left:
+        sa_file = st.file_uploader("Service Account JSON", type=["json"], key="config_google_service_account_file")
+        if sa_file is not None:
+            try:
+                st.session_state["config_google_service_account_json"] = sa_file.getvalue().decode("utf-8")
+                st.success("Service Account JSON загружен.")
+            except Exception as error:  # noqa: BLE001
+                st.error(f"Не удалось прочитать Service Account JSON: {error}")
+        st.text_input("GSC Site URL", key="config_gsc_site_url", placeholder="sc-domain:example.com")
+        st.text_input("GA4 Property ID", key="config_ga4_property_id", placeholder="123456789")
+    with api_right:
+        st.text_input("Период: start_date (YYYY-MM-DD)", key="config_google_start_date")
+        st.text_input("Период: end_date (YYYY-MM-DD)", key="config_google_end_date")
+        if st.button("Проверить Google API коннекторы", key="btn_refresh_google_api", use_container_width=True):
+            _refresh_google_api_integrations_state(_settings())
+            _attach_integrations_to_action_pack()
+
+    gsc_api_data = st.session_state.get("integration_gsc_api_data", {})
+    ga4_api_data = st.session_state.get("integration_ga4_api_data", {})
+    if gsc_api_data:
+        if bool(gsc_api_data.get("ok")):
+            st.success(
+                f"GSC API подключен: строки {gsc_api_data.get('rows', 0)}, "
+                f"клики {gsc_api_data.get('total_clicks', 0)}, показы {gsc_api_data.get('total_impressions', 0)}."
+            )
+        else:
+            st.warning(str(gsc_api_data.get("error", "Ошибка подключения GSC API.")))
+    if ga4_api_data:
+        if bool(ga4_api_data.get("ok")):
+            st.success(
+                f"GA4 API подключен: строки {ga4_api_data.get('rows', 0)}, "
+                f"сеансы {ga4_api_data.get('total_sessions', 0)}, пользователи {ga4_api_data.get('total_users', 0)}."
+            )
+        else:
+            st.warning(str(ga4_api_data.get("error", "Ошибка подключения GA4 API.")))
+
+    st.markdown("**CSV fallback (если API не подключен)**")
+    st.file_uploader("Импорт GSC CSV (Search Console)", type=["csv"], key="config_gsc_csv")
+    st.file_uploader("Импорт GA4 CSV (Landing page report)", type=["csv"], key="config_ga4_csv")
+    _refresh_uploaded_integrations_state()
+
+    gsc_data = st.session_state.get("integration_gsc_data", {})
+    ga4_data = st.session_state.get("integration_ga4_data", {})
+
+    if gsc_data:
+        if bool(gsc_data.get("ok")):
+            st.success(
+                f"GSC подключен: строк {gsc_data.get('rows', 0)}, "
+                f"клики {gsc_data.get('total_clicks', 0)}, показы {gsc_data.get('total_impressions', 0)}."
+            )
+        else:
+            st.warning(str(gsc_data.get("error", "Ошибка чтения GSC CSV.")))
+    if ga4_data:
+        if bool(ga4_data.get("ok")):
+            st.success(
+                f"GA4 подключен: строк {ga4_data.get('rows', 0)}, "
+                f"сеансы {ga4_data.get('total_sessions', 0)}, пользователи {ga4_data.get('total_users', 0)}."
+            )
+        else:
+            st.warning(str(ga4_data.get("error", "Ошибка чтения GA4 CSV.")))
+
     st.success("Настройки применяются автоматически.")
     st.divider()
     st.subheader("Платежные переменные окружения")
     st.code(
         """PAYMENT_PROVIDER=payment_links
-PAYMENT_LINK_START=https://...
+PAYMENT_LINK_STARTER=https://...
 PAYMENT_LINK_GROWTH=https://...
-PAYMENT_LINK_SCALE=https://...
+PAYMENT_LINK_PRO=https://...
+PAYMENT_LINK_AGENCY=https://...
 PAYMENT_ALLOW_MANUAL_CONFIRM=false
 """,
         language="bash",
@@ -1622,9 +1889,12 @@ def render_new_audit_page() -> None:
                     source_text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
                     if not _consume_action(ACTION_URL_AUDIT):
                         return
+                    _refresh_pagespeed_state(url.strip(), settings)
+                    _refresh_google_api_integrations_state(settings)
                     _save_analysis_result(result, source_text, url.strip(), settings)
                     _refresh_history_state(result, settings)
                     _run_competitor_benchmark(result, url.strip(), settings)
+                    _attach_integrations_to_action_pack()
                     st.success("URL успешно проанализирован.")
                     _go("Результат")
                 except Exception as error:  # noqa: BLE001
@@ -1652,9 +1922,12 @@ def render_new_audit_page() -> None:
                 )
                 if not _consume_action(ACTION_TEXT_AUDIT):
                     return
+                st.session_state["integration_pagespeed_data"] = {}
+                _refresh_google_api_integrations_state(settings)
                 _save_analysis_result(result, text, "article_text", settings)
                 _refresh_history_state(result, settings)
                 st.session_state["competitor_benchmark"] = {}
+                _attach_integrations_to_action_pack()
                 st.success("Текст успешно проанализирован.")
                 _go("Результат")
 
@@ -1669,11 +1942,12 @@ def render_result_page() -> None:
     medium = sum(1 for i in result.issues if i.priority == "MEDIUM")
     low = sum(1 for i in result.issues if i.priority == "LOW")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Оценка", f"{result.score}/100")
+    c1.metric("Эвристический индекс", f"{result.score}/100")
     c2.metric("Критично", high)
     c3.metric("Важно", medium)
     c4.metric("Желательно", low)
     st.progress(min(max(result.score, 0), 100) / 100)
+    st.caption("Индекс показывает приоритеты по нашей модели и не является абсолютной SEO-истиной.")
 
     st.subheader("Приоритет проблем")
     for issue in sorted_issues(result)[:16]:
@@ -1702,6 +1976,87 @@ def render_result_page() -> None:
 
     st.subheader("Метрики")
     st.json(result.metrics)
+
+    st.subheader("Глубина и источники анализа")
+    source_flags = []
+    if st.session_state.get("query_audit"):
+        source_flags.append("query/intent аудит")
+    if st.session_state.get("competitor_benchmark"):
+        source_flags.append("данные конкурентов")
+    if st.session_state.get("changelog"):
+        source_flags.append("история изменений")
+    if not source_flags:
+        source_flags.append("базовые on-page эвристики")
+    st.markdown(f"- Использованы источники: {', '.join(source_flags)}.")
+    st.markdown("- Для продакшн-решений дополнительно подключайте GSC/GA4 и performance-данные.")
+
+    st.subheader("Внешние данные (интеграции)")
+    pagespeed_data = st.session_state.get("integration_pagespeed_data", {})
+    gsc_api_data = st.session_state.get("integration_gsc_api_data", {})
+    ga4_api_data = st.session_state.get("integration_ga4_api_data", {})
+    gsc_data = st.session_state.get("integration_gsc_data", {})
+    ga4_data = st.session_state.get("integration_ga4_data", {})
+
+    if pagespeed_data:
+        if bool(pagespeed_data.get("ok")):
+            st.markdown("**PageSpeed API**")
+            scores = pagespeed_data.get("scores", {}) or {}
+            ps1, ps2, ps3, ps4 = st.columns(4)
+            ps1.metric("Performance", scores.get("performance", "—"))
+            ps2.metric("SEO", scores.get("seo", "—"))
+            ps3.metric("Accessibility", scores.get("accessibility", "—"))
+            ps4.metric("Best Practices", scores.get("best-practices", "—"))
+            cwv = pagespeed_data.get("field_core_web_vitals", {}) or {}
+            lab = pagespeed_data.get("lab_metrics", {}) or {}
+            st.caption(
+                f"CWV field: LCP {cwv.get('field_lcp_ms', '—')} ms | "
+                f"INP {cwv.get('field_inp_ms', '—')} ms | CLS {cwv.get('field_cls', '—')}"
+            )
+            st.caption(
+                f"Lab: FCP {lab.get('fcp_ms', '—')} ms | "
+                f"LCP {lab.get('lcp_ms', '—')} ms | TBT {lab.get('tbt_ms', '—')} ms"
+            )
+        else:
+            st.warning(str(pagespeed_data.get("error", "PageSpeed данные недоступны.")))
+    else:
+        st.info("PageSpeed API не подключен.")
+
+    if gsc_api_data:
+        if bool(gsc_api_data.get("ok")):
+            st.markdown(
+                f"**GSC API**: клики {gsc_api_data.get('total_clicks', 0)}, "
+                f"показы {gsc_api_data.get('total_impressions', 0)}, CTR {gsc_api_data.get('avg_ctr', 0)}%, "
+                f"средняя позиция {gsc_api_data.get('avg_position', '—')}."
+            )
+        else:
+            st.warning(str(gsc_api_data.get("error", "GSC API данные недоступны.")))
+    elif gsc_data:
+        if bool(gsc_data.get("ok")):
+            st.markdown(
+                f"**GSC CSV**: клики {gsc_data.get('total_clicks', 0)}, "
+                f"показы {gsc_data.get('total_impressions', 0)}, CTR {gsc_data.get('avg_ctr', 0)}%, "
+                f"средняя позиция {gsc_data.get('avg_position', '—')}."
+            )
+        else:
+            st.warning(str(gsc_data.get("error", "GSC данные недоступны.")))
+    if ga4_api_data:
+        if bool(ga4_api_data.get("ok")):
+            st.markdown(
+                f"**GA4 API**: сеансы {ga4_api_data.get('total_sessions', 0)}, "
+                f"пользователи {ga4_api_data.get('total_users', 0)}, "
+                f"конверсии {ga4_api_data.get('total_conversions', 0)}."
+            )
+        else:
+            st.warning(str(ga4_api_data.get("error", "GA4 API данные недоступны.")))
+    elif ga4_data:
+        if bool(ga4_data.get("ok")):
+            st.markdown(
+                f"**GA4 CSV**: сеансы {ga4_data.get('total_sessions', 0)}, "
+                f"пользователи {ga4_data.get('total_users', 0)}, "
+                f"конверсии {ga4_data.get('total_conversions', 0)}."
+            )
+        else:
+            st.warning(str(ga4_data.get("error", "GA4 данные недоступны.")))
 
     one_page = build_one_page_report(result, brand_name=str(_settings()["brand"]))
     st.session_state["one_page_report_md"] = one_page
@@ -1732,6 +2087,9 @@ def render_action_lab_page() -> None:
     additions = action_pack.get("what_to_add_on_page", []) or []
     internal_links = action_pack.get("internal_link_suggestions", []) or []
     dev_tickets = action_pack.get("dev_tickets", []) or []
+    indexation_summary = action_pack.get("indexation_summary", {}) or {}
+    data_sources_summary = action_pack.get("data_sources_summary", {}) or {}
+    integrations = action_pack.get("integrations", {}) or {}
 
     st.markdown(
         """
@@ -1752,7 +2110,7 @@ def render_action_lab_page() -> None:
     tab_exec, tab_content, tab_dev = st.tabs(["План действий", "Контент и структура", "Dev и экспорт"])
 
     with tab_exec:
-        st.subheader("Problem в†' Evidence в†' Why в†' Fix в†' Verify")
+        st.subheader("Problem -> Evidence -> Why -> Fix -> Verify")
         if not playbook:
             st.markdown('<div class="al-empty">Данных пока нет. Запустите аудит, и здесь появится план исправлений.</div>', unsafe_allow_html=True)
         for idx, item in enumerate(playbook, start=1):
@@ -1783,16 +2141,118 @@ def render_action_lab_page() -> None:
         if not query_audit_rows:
             st.markdown('<div class="al-empty">Query/intent данные пока отсутствуют.</div>', unsafe_allow_html=True)
         for row in query_audit_rows:
+            status_raw = str(row.get("status", "unknown"))
+            status_map = {"covered": "покрыт", "partial": "частично", "gap": "пробел"}
+            status_label = status_map.get(status_raw, status_raw)
             st.markdown(
                 f"""
                 <div class="al-card">
                   <p class="al-title">{html.escape(str(row.get("query", "—")))}</p>
-                  <p class="al-sub">Статус | {html.escape(str(row.get("status", "—")))} | Покрытие | {html.escape(str(row.get("coverage_pct", "—")))}%</p>
-                  <p class="al-text"><b>Что добавить:</b> {html.escape(str(row.get("action", "—")))}</p>
+                  <p class="al-sub">Статус | {html.escape(status_label)} | Покрытие | {html.escape(str(row.get("coverage_score", "—")))}%</p>
+                  <p class="al-text"><b>Что добавить:</b> {html.escape(str(row.get("recommendation", "—")))}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+        st.subheader("Индексация и рендер")
+        if indexation_summary:
+            st.markdown('<div class="al-card">', unsafe_allow_html=True)
+            st.markdown(f"**Вердикт:** {indexation_summary.get('verdict', '—')}")
+            checks = indexation_summary.get("checks", []) or []
+            for check in checks:
+                name = html.escape(str(check.get("name", "—")))
+                value = html.escape(str(check.get("value", "—")))
+                st.markdown(f"- **{name}:** {value}")
+            st.markdown(
+                f"**Как проверить после релиза:** {indexation_summary.get('post_release_check', '—')}"
+            )
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="al-empty">Данные индексации отсутствуют.</div>', unsafe_allow_html=True)
+
+        st.subheader("Данные и ограничения модели")
+        if data_sources_summary:
+            st.markdown('<div class="al-card">', unsafe_allow_html=True)
+            st.markdown(f"- Тип оценки: **{html.escape(str(data_sources_summary.get('score_type', 'heuristic')))}**")
+            st.markdown(f"- Режим анализа: **{html.escape(str(data_sources_summary.get('analysis_mode', 'n/a')))}**")
+            st.markdown(
+                f"- Query audit строк: **{html.escape(str(data_sources_summary.get('query_audit_rows', 0)))}**"
+            )
+            ext_ok = bool(data_sources_summary.get("has_external_competitor_data", False))
+            st.markdown(f"- Внешние конкурентные данные: **{'доступны' if ext_ok else 'не подключены'}**")
+            for note in data_sources_summary.get("notes", []) or []:
+                st.markdown(f"- {note}")
+            st.markdown("</div>", unsafe_allow_html=True)
+        else:
+            st.markdown('<div class="al-empty">Сводка источников данных пока отсутствует.</div>', unsafe_allow_html=True)
+
+        st.subheader("Внешние интеграции")
+        pagespeed_data = integrations.get("pagespeed", {}) if isinstance(integrations, dict) else {}
+        gsc_api_data = integrations.get("gsc_api", {}) if isinstance(integrations, dict) else {}
+        ga4_api_data = integrations.get("ga4_api", {}) if isinstance(integrations, dict) else {}
+        gsc_data = integrations.get("gsc_csv", {}) if isinstance(integrations, dict) else {}
+        ga4_data = integrations.get("ga4_csv", {}) if isinstance(integrations, dict) else {}
+
+        if pagespeed_data:
+            if bool(pagespeed_data.get("ok")):
+                st.markdown('<div class="al-card">', unsafe_allow_html=True)
+                st.markdown(
+                    f"**PageSpeed** ({pagespeed_data.get('strategy', 'mobile')}): "
+                    f"Performance {pagespeed_data.get('scores', {}).get('performance', '—')} | "
+                    f"SEO {pagespeed_data.get('scores', {}).get('seo', '—')}"
+                )
+                for opp in pagespeed_data.get("opportunities", [])[:5]:
+                    st.markdown(f"- {opp.get('title', '—')}: {opp.get('display_value', '—')}")
+                st.markdown("</div>", unsafe_allow_html=True)
+            else:
+                st.warning(str(pagespeed_data.get("error", "PageSpeed данные недоступны.")))
+        else:
+            st.info("PageSpeed не подключен.")
+
+        if gsc_api_data:
+            if bool(gsc_api_data.get("ok")):
+                st.markdown(
+                    f"**GSC API**: клики {gsc_api_data.get('total_clicks', 0)} | "
+                    f"показы {gsc_api_data.get('total_impressions', 0)} | "
+                    f"CTR {gsc_api_data.get('avg_ctr', 0)}% | "
+                    f"позиция {gsc_api_data.get('avg_position', '—')}."
+                )
+                top_queries = gsc_api_data.get("top_queries_by_clicks", []) or []
+                for row in top_queries[:5]:
+                    st.markdown(f"- Query: {row.get('name', '—')} ({row.get('value', 0)} кликов)")
+            else:
+                st.warning(str(gsc_api_data.get("error", "GSC API данные недоступны.")))
+        elif gsc_data:
+            if bool(gsc_data.get("ok")):
+                st.markdown(
+                    f"**GSC**: клики {gsc_data.get('total_clicks', 0)} | "
+                    f"показы {gsc_data.get('total_impressions', 0)} | "
+                    f"CTR {gsc_data.get('avg_ctr', 0)}%."
+                )
+            else:
+                st.warning(str(gsc_data.get("error", "GSC данные недоступны.")))
+        if ga4_api_data:
+            if bool(ga4_api_data.get("ok")):
+                st.markdown(
+                    f"**GA4 API**: сеансы {ga4_api_data.get('total_sessions', 0)} | "
+                    f"пользователи {ga4_api_data.get('total_users', 0)} | "
+                    f"конверсии {ga4_api_data.get('total_conversions', 0)}."
+                )
+                top_pages = ga4_api_data.get("top_landing_pages_by_sessions", []) or []
+                for row in top_pages[:5]:
+                    st.markdown(f"- Landing page: {row.get('name', '—')} ({row.get('value', 0)} сеансов)")
+            else:
+                st.warning(str(ga4_api_data.get("error", "GA4 API данные недоступны.")))
+        elif ga4_data:
+            if bool(ga4_data.get("ok")):
+                st.markdown(
+                    f"**GA4**: сеансы {ga4_data.get('total_sessions', 0)} | "
+                    f"пользователи {ga4_data.get('total_users', 0)} | "
+                    f"конверсии {ga4_data.get('total_conversions', 0)}."
+                )
+            else:
+                st.warning(str(ga4_data.get("error", "GA4 данные недоступны.")))
 
     with tab_content:
         st.subheader("Meta title / description (3 варианта)")
@@ -1917,12 +2377,15 @@ def render_action_lab_page() -> None:
             row_url = html.escape(str(row.get("url", "—")))
             row_score = html.escape(str(row.get("score", "—")))
             row_status = html.escape(str(row.get("status", "—")))
+            row_indexability = html.escape(str(row.get("indexability_status", "n/a")))
+            row_cta = html.escape(str(row.get("cta_status", "n/a")))
             row_flag = "Целевая страница" if bool(row.get("is_target")) else "Конкурент"
             st.markdown(
                 f"""
                 <div class="al-card">
                   <p class="al-kv"><b>{row_flag}:</b> {row_url}</p>
-                  <p class="al-kv"><b>Score:</b> {row_score} | <b>Статус:</b> {row_status}</p>
+                  <p class="al-kv"><b>Эвристический индекс:</b> {row_score} | <b>Статус:</b> {row_status}</p>
+                  <p class="al-kv"><b>Indexability:</b> {row_indexability} | <b>CTA:</b> {row_cta}</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
@@ -2043,7 +2506,16 @@ def render_billing_page() -> None:
         """
         <div class="section-card">
           <h3>Тарифы</h3>
-          <p>Оформите подписку и используйте SEO-анализатор без ограничений интерфейса.</p>
+          <p>Выберите план под ваш объем задач: от быстрого старта до enterprise-масштаба.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="section-card">
+          <h3>Почему это окупается</h3>
+          <p>Меньше ручной рутины, больше управляемых SEO-действий: аудит, приоритеты, action-план и клиентский отчет в одном кабинете.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2062,7 +2534,10 @@ def render_billing_page() -> None:
     if sub:
         status = str(sub.get("status", "unknown"))
         if status == "active":
-            st.success(f"Ваш активный тариф: {sub.get('plan_title')} · {sub.get('price_rub')} ₽/мес")
+            st.success(
+                f"Ваш активный тариф: {sub.get('plan_title')} · "
+                f"{sub.get('price_rub_display') or (str(sub.get('price_rub')) + ' ₽ / мес')}"
+            )
         else:
             st.warning(f"Подписка найдена, но не активна (status={status}).")
     else:
@@ -2070,23 +2545,29 @@ def render_billing_page() -> None:
 
     plan_copy = {
         "starter": {
-            "badge": "Для старта",
-            "tagline": "Базовый пакет для небольших проектов.",
+            "badge": "Start fast",
+            "tagline": "Для фриланса и первого продукта: быстро запустить аудит и получить план улучшений.",
+        },
+        "growth": {
+            "badge": "Best value",
+            "tagline": "Для малого бизнеса: постоянный поток задач, AI-автоматизация и weekly-отчеты.",
         },
         "pro": {
-            "badge": "Оптимальный выбор",
-            "tagline": "Оптимальный пакет для постоянной работы.",
+            "badge": "Team scale",
+            "tagline": "Для команд и агентств: несколько брендов, white-label и глубокая аналитика.",
         },
         "agency": {
-            "badge": "Максимум",
-            "tagline": "Безлимит и максимум возможностей.",
+            "badge": "Enterprise",
+            "tagline": "Для крупных команд: API, роли, клиентские кабинеты и приоритетная поддержка.",
         },
     }
 
-    cols = st.columns(3)
-    for idx, (plan_id, plan) in enumerate(PLANS.items()):
+    plan_items = list(PLANS.items())
+    cols = st.columns(len(plan_items))
+    button_items: list[dict[str, object]] = []
+    for idx, (plan_id, plan) in enumerate(plan_items):
         info = plan_copy.get(plan_id, {"badge": "Тариф", "tagline": ""})
-        is_recommended = plan_id == "pro"
+        is_recommended = plan_id == "growth"
         is_active = bool(sub and sub.get("plan_id") == plan_id and sub.get("status") == "active")
         badge = info["badge"]
         if is_recommended:
@@ -2098,7 +2579,7 @@ def render_billing_page() -> None:
         )
         card_class = "plan-card plan-card-highlight" if is_recommended else "plan-card"
 
-        with cols[idx % 3]:
+        with cols[idx]:
             st.markdown(
                 f"""
                 <div class="{card_class}">
@@ -2106,18 +2587,36 @@ def render_billing_page() -> None:
                     <div class="plan-title">{plan.title}</div>
                     <div class="plan-badge">{badge}</div>
                   </div>
-                  <div class="plan-price">{plan.monthly_price_rub} ?</div>
-                  <div class="plan-period">в месяц</div>
-                  <div class="plan-tagline">{info["tagline"]}</div>
-                  {features_html}
-                  <div class="plan-muted">Лимиты в месяц:</div>
-                  {limits_html}
+                  <div class="plan-price">{plan.price_rub_display}</div>
+                  <div class="plan-period">{plan.price_usdt_display}</div>
+                  <div class="plan-copy">
+                    <div class="plan-tagline">{info["tagline"]}</div>
+                    <div class="plan-tagline">{plan.description}</div>
+                  </div>
+                  <div class="plan-features">{features_html}</div>
+                  <div class="plan-limits">
+                    <div class="plan-muted">Лимиты в месяц:</div>
+                    {limits_html}
+                  </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            button_items.append(
+                {
+                    "plan_id": plan_id,
+                    "plan_title": plan.title,
+                    "is_active": is_active,
+                }
+            )
 
-            btn_label = "Тариф активен" if is_active else f"Оформить {plan.title}"
+    button_cols = st.columns(len(plan_items))
+    for idx, item in enumerate(button_items):
+        plan_id = str(item["plan_id"])
+        plan_title = str(item["plan_title"])
+        is_active = bool(item["is_active"])
+        btn_label = "Тариф активен" if is_active else f"Оформить {plan_title}"
+        with button_cols[idx]:
             if st.button(btn_label, key=f"activate_plan_{plan_id}", use_container_width=True, disabled=is_active):
                 if not user:
                     st.error("Сначала войдите в аккаунт.")
@@ -2184,6 +2683,7 @@ def main() -> None:
     init_billing_db()
     init_session_state()
     _is_authenticated()
+    _restore_auth_from_persistent_token()
     inject_ui_styles()
     inject_motion_script()
     render_app_header()
@@ -2231,6 +2731,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 

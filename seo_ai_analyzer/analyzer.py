@@ -86,6 +86,24 @@ CTA_PATTERNS = (
     'скачать',
     'попробовать',
     'зарегистрироваться',
+    'download',
+    'get started',
+    'start now',
+    'sign up',
+    'book demo',
+    'contact us',
+    'view pricing',
+    'try free',
+)
+CTA_WEAK_PATTERNS = (
+    'подробнее',
+    'узнать больше',
+    'читать',
+    'view',
+    'read more',
+    'learn more',
+    'details',
+    'show more',
 )
 GENERIC_ANCHORS = {'читать', 'подробнее', 'узнать больше', 'ссылка', 'here', 'click here'}
 WORD_RE = re.compile(r'[A-Za-zА-Яа-яЁё0-9]+')
@@ -182,6 +200,10 @@ def analyze_html(source: str, html: str, keywords: list[str] | None = None) -> A
     has_loading_placeholder = _has_render_placeholder(text_lower, soup)
     risky_copy_hits = _count_hits(text_lower, RISK_COPY_PATTERNS)
     cta_hits = _count_hits(text_lower, CTA_PATTERNS)
+    cta_status, cta_strength_score, cta_element_count, cta_strong_elements, cta_weak_elements = _detect_cta_signals_html(
+        soup=soup,
+        text_lower=text_lower,
+    )
     intent_coverage_pct = _estimate_intent_coverage(text_lower, h2_tags, keywords, title, h1_tags)
     faq_signal_count = _faq_signal_count(text, has_faq_schema)
 
@@ -206,6 +228,7 @@ def analyze_html(source: str, html: str, keywords: list[str] | None = None) -> A
 
     has_lang_attr = bool(html_tag and (html_tag.get('lang') or '').strip())
     has_viewport = bool(soup.find('meta', attrs={'name': 'viewport'}))
+    indexability_status = _estimate_indexability_status(has_noindex, canonical, has_lang_attr, has_viewport)
     script_count = len(soup.find_all('script'))
     script_to_text_ratio = round((script_count / word_count), 3) if word_count else float(script_count)
 
@@ -244,6 +267,8 @@ def analyze_html(source: str, html: str, keywords: list[str] | None = None) -> A
         'has_lang_attr': 1 if has_lang_attr else 0,
         'has_viewport': 1 if has_viewport else 0,
         'has_noindex': 1 if has_noindex else 0,
+        'robots_meta': str(robots).strip() or 'index, follow (default)',
+        'indexability_status': indexability_status,
         'schema_count': schema_count,
         'has_faq_schema': 1 if has_faq_schema else 0,
         'has_breadcrumb_schema': 1 if has_breadcrumb_schema else 0,
@@ -252,6 +277,11 @@ def analyze_html(source: str, html: str, keywords: list[str] | None = None) -> A
         'risky_copywriting_hits': risky_copy_hits,
         'intent_coverage_pct': round(intent_coverage_pct, 2),
         'cta_signal_hits': cta_hits,
+        'cta_status': cta_status,
+        'cta_strength_score': cta_strength_score,
+        'cta_element_count': cta_element_count,
+        'cta_strong_elements': cta_strong_elements,
+        'cta_weak_elements': cta_weak_elements,
         'faq_signal_count': faq_signal_count,
         'trust_signal_score': trust_signal_score,
         'has_author_signal': 1 if has_author_signal else 0,
@@ -295,6 +325,8 @@ def analyze_html(source: str, html: str, keywords: list[str] | None = None) -> A
         issues,
         intent_coverage_pct,
         faq_signal_count,
+        cta_status,
+        cta_element_count,
         cta_hits,
         keywords,
         title,
@@ -345,6 +377,7 @@ def analyze_text_article(
 
     risky_copy_hits = _count_hits(text_lower, RISK_COPY_PATTERNS)
     cta_hits = _count_hits(text_lower, CTA_PATTERNS)
+    cta_status, cta_strength_score = _detect_cta_signals_text(text_lower)
     intent_coverage_pct = _estimate_intent_coverage(text_lower, [], keywords, title, [])
     faq_signal_count = _faq_signal_count(cleaned, False)
     has_author_signal = bool(re.search(r'\b(автор|author)\b', text_lower))
@@ -371,11 +404,17 @@ def analyze_text_article(
         'risky_copywriting_hits': risky_copy_hits,
         'intent_coverage_pct': round(intent_coverage_pct, 2),
         'cta_signal_hits': cta_hits,
+        'cta_status': cta_status,
+        'cta_strength_score': cta_strength_score,
+        'cta_element_count': 0,
+        'cta_strong_elements': 0,
+        'cta_weak_elements': 0,
         'faq_signal_count': faq_signal_count,
         'trust_signal_score': trust_signal_score,
         'has_author_signal': 1 if has_author_signal else 0,
         'has_date_signal': 1 if has_date_signal else 0,
         'has_contact_signal': 1 if has_contact_signal else 0,
+        'indexability_status': 'n/a_text_mode',
     }
 
     if not title.strip():
@@ -392,7 +431,7 @@ def analyze_text_article(
         unique_ratio,
         risky_copy_hits,
     )
-    _audit_intent(issues, intent_coverage_pct, faq_signal_count, cta_hits, keywords, title, [], text_lower)
+    _audit_intent(issues, intent_coverage_pct, faq_signal_count, cta_status, 0, cta_hits, keywords, title, [], text_lower)
     _audit_trust(issues, trust_signal_score, has_author_signal, has_date_signal, has_contact_signal, False)
 
     keyword_stats = _keyword_density(words, keywords)
@@ -494,6 +533,8 @@ def _audit_intent(
     issues: list[SEOIssue],
     intent_coverage_pct: float,
     faq_signal_count: int,
+    cta_status: str,
+    cta_element_count: int,
     cta_hits: int,
     keywords: list[str],
     title: str,
@@ -507,8 +548,27 @@ def _audit_intent(
 
     if faq_signal_count == 0:
         _add_issue(issues, 'LOW', CAT_INTENT, 'Нет FAQ-сигнала', 'Добавьте FAQ-блок из 3-5 вопросов.', 2)
-    if cta_hits == 0:
-        _add_issue(issues, 'LOW', CAT_INTENT, 'Нет CTA', 'Добавьте естественный CTA в конце страницы.', 2)
+    if cta_status == 'missing':
+        _add_issue(
+            issues,
+            'LOW',
+            CAT_INTENT,
+            'CTA не обнаружен',
+            'Добавьте явный CTA-блок (например: “Получить консультацию”, “Оставить заявку”, “Скачать чек-лист”).',
+            2,
+        )
+    elif cta_status == 'weak':
+        _add_issue(
+            issues,
+            'LOW',
+            CAT_INTENT,
+            'CTA есть, но выглядит слабым',
+            (
+                'Сделайте CTA контекстным и конкретным: опишите результат действия, '
+                'усильте формулировку и оставьте 1-2 главных кнопки без шума.'
+            ),
+            1 if (cta_hits > 0 or cta_element_count > 0) else 2,
+        )
 
     if keywords:
         h1_text = h1_tags[0].get_text(' ', strip=True).lower() if h1_tags else ''
@@ -615,6 +675,79 @@ def _has_render_placeholder(text_lower: str, soup: BeautifulSoup) -> bool:
 
 def _count_hits(text: str, patterns: tuple[str, ...]) -> int:
     return sum(text.count(p) for p in patterns)
+
+
+def _cta_label(tag) -> str:
+    if tag.name == 'input':
+        return _clean_text(f"{tag.get('value', '')} {tag.get('aria-label', '')} {tag.get('name', '')}")
+    return _clean_text(tag.get_text(' ', strip=True))
+
+
+def _detect_cta_signals_html(soup: BeautifulSoup, text_lower: str) -> tuple[str, float, int, int, int]:
+    strong_count = 0
+    weak_count = 0
+    total_candidates = 0
+
+    for tag in soup.find_all(['a', 'button', 'input']):
+        if tag.name == 'input' and str(tag.get('type', '')).lower() not in {'submit', 'button'}:
+            continue
+
+        label = _cta_label(tag).lower()
+        href = str(tag.get('href', '')).lower()
+        if not label and not href:
+            continue
+
+        signal = f'{label} {href}'.strip()
+        if not signal:
+            continue
+
+        total_candidates += 1
+        if any(pattern in signal for pattern in CTA_PATTERNS):
+            strong_count += 1
+        elif any(pattern in signal for pattern in CTA_WEAK_PATTERNS):
+            weak_count += 1
+
+    text_hits = _count_hits(text_lower, CTA_PATTERNS)
+    weak_text_hits = _count_hits(text_lower, CTA_WEAK_PATTERNS)
+    strong_total = strong_count + min(text_hits, 3)
+    weak_total = weak_count + min(weak_text_hits, 3)
+
+    strength_score = max(0.0, min(100.0, (strong_total * 28) + (weak_total * 8)))
+    if strong_total == 0 and weak_total == 0:
+        status = 'missing'
+    elif strong_total >= 2 or strength_score >= 55:
+        status = 'strong'
+    else:
+        status = 'weak'
+
+    return status, round(strength_score, 2), total_candidates, strong_count, weak_count
+
+
+def _detect_cta_signals_text(text_lower: str) -> tuple[str, float]:
+    strong_hits = _count_hits(text_lower, CTA_PATTERNS)
+    weak_hits = _count_hits(text_lower, CTA_WEAK_PATTERNS)
+    strength_score = max(0.0, min(100.0, (strong_hits * 30) + (weak_hits * 10)))
+
+    if strong_hits == 0 and weak_hits == 0:
+        return 'missing', round(strength_score, 2)
+    if strong_hits >= 2 or strength_score >= 55:
+        return 'strong', round(strength_score, 2)
+    return 'weak', round(strength_score, 2)
+
+
+def _estimate_indexability_status(
+    has_noindex: bool,
+    has_canonical: bool,
+    has_lang_attr: bool,
+    has_viewport: bool,
+) -> str:
+    if has_noindex:
+        return 'blocked_noindex'
+    if not has_canonical:
+        return 'warning_no_canonical'
+    if not has_lang_attr or not has_viewport:
+        return 'warning_meta_incomplete'
+    return 'indexable'
 
 
 def _estimate_intent_coverage(

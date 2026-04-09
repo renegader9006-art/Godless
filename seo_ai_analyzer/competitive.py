@@ -131,6 +131,9 @@ def _metric_subset(result: AnalysisResult) -> dict[str, object]:
         'h2_count': int(metrics.get('h2_count', 0) or 0),
         'intent_coverage_pct': float(metrics.get('intent_coverage_pct', 0) or 0),
         'schema_count': int(metrics.get('schema_count', 0) or 0),
+        'indexability_status': str(metrics.get('indexability_status', 'n/a')),
+        'cta_status': str(metrics.get('cta_status', 'n/a')),
+        'risky_copywriting_hits': int(metrics.get('risky_copywriting_hits', 0) or 0),
     }
 
 
@@ -149,6 +152,7 @@ def _build_insights(
         ('h2_count', 'структура H2'),
         ('intent_coverage_pct', 'покрытие интента'),
         ('schema_count', 'schema markup'),
+        ('risky_copywriting_hits', 'рискованный copywriting'),
     ]
 
     for field, label in fields:

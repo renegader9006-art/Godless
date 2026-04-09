@@ -206,6 +206,8 @@ def build_action_pack(
     links = build_internal_link_suggestions(source_url, queries)
     playbook = build_problem_playbook(result)
     tickets = build_dev_tickets(playbook)
+    indexation = build_indexation_summary(result)
+    data_sources = build_data_sources_summary(result, query_audit, source_url)
 
     return {
         'problem_playbook': playbook,
@@ -217,6 +219,8 @@ def build_action_pack(
         'internal_link_suggestions': links,
         'dev_tickets': tickets,
         'query_audit': query_audit,
+        'indexation_summary': indexation,
+        'data_sources_summary': data_sources,
         'summary': {
             'source': result.source,
             'score': result.score,
@@ -264,6 +268,14 @@ def _build_evidence(issue_title: str, metrics: dict[str, Any]) -> str:
         )
     if 'интент' in title_lower:
         return f"intent_coverage_pct={metrics.get('intent_coverage_pct', 'n/a')}"
+    if 'cta' in title_lower:
+        return (
+            f"cta_status={metrics.get('cta_status', 'n/a')}, "
+            f"cta_elements={metrics.get('cta_element_count', 'n/a')}, "
+            f"cta_strength_score={metrics.get('cta_strength_score', 'n/a')}"
+        )
+    if 'noindex' in title_lower:
+        return f"has_noindex={metrics.get('has_noindex', 'n/a')}, robots_meta={metrics.get('robots_meta', 'n/a')}"
     return 'См. метрики в отчете'
 
 
@@ -308,3 +320,60 @@ def _post_release_check(issue_title: str, category: str) -> str:
     if category == 'Интент и полезность':
         return 'Повторный краул: intent_coverage_pct вырос, добавлены FAQ/CTA блоки.'
     return 'Повторный краул страницы: проблема закрыта или снижена по приоритету.'
+
+
+def build_indexation_summary(result: AnalysisResult) -> dict[str, object]:
+    metrics = result.metrics
+    has_noindex = int(metrics.get('has_noindex', 0) or 0) == 1
+    has_canonical = int(metrics.get('has_canonical', 0) or 0) == 1
+    has_lang_attr = int(metrics.get('has_lang_attr', 0) or 0) == 1
+    has_viewport = int(metrics.get('has_viewport', 0) or 0) == 1
+
+    if has_noindex:
+        verdict = 'Риск: страница закрыта от индексации (noindex).'
+    elif not has_canonical:
+        verdict = 'Предупреждение: нет canonical, возможны дубли и размывание сигналов.'
+    elif not has_lang_attr or not has_viewport:
+        verdict = 'Предупреждение: базовые технические сигналы неполные.'
+    else:
+        verdict = 'Базовая индексируемость выглядит корректно.'
+
+    checks = [
+        {'name': 'Meta robots', 'value': str(metrics.get('robots_meta', 'index, follow (default)'))},
+        {'name': 'Noindex', 'value': 'Да' if has_noindex else 'Нет'},
+        {'name': 'Canonical', 'value': 'Есть' if has_canonical else 'Нет'},
+        {'name': 'Lang', 'value': 'Есть' if has_lang_attr else 'Нет'},
+        {'name': 'Viewport', 'value': 'Есть' if has_viewport else 'Нет'},
+        {'name': 'Indexability status', 'value': str(metrics.get('indexability_status', 'n/a'))},
+    ]
+
+    return {
+        'verdict': verdict,
+        'checks': checks,
+        'post_release_check': 'После релиза повторить краул и убедиться, что noindex=0 и canonical присутствует.',
+    }
+
+
+def build_data_sources_summary(
+    result: AnalysisResult,
+    query_audit: list[dict[str, str | int | float]],
+    source_url: str,
+) -> dict[str, object]:
+    score_type = str(result.metrics.get('score_type', 'heuristic'))
+    query_rows = len(query_audit)
+    mode = 'url' if source_url.startswith('http') else 'text'
+
+    notes = [
+        'SEO-оценка рассчитывается эвристически и используется как индикатор приоритетов, а не как абсолютная истина.',
+        'Для финальных решений рекомендуется сверка с GSC/GA4 и бизнес-метриками.',
+    ]
+    if mode == 'text':
+        notes.append('Режим текста не содержит данных реального краула и конкурентного окружения страницы.')
+
+    return {
+        'score_type': score_type,
+        'analysis_mode': mode,
+        'query_audit_rows': query_rows,
+        'has_external_competitor_data': mode == 'url',
+        'notes': notes,
+    }

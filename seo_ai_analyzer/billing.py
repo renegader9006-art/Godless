@@ -19,10 +19,11 @@ ACTION_COMPETITORS = "competitor_benchmark"
 PAYMENT_PROVIDER_DEMO = "demo"
 PAYMENT_PROVIDER_LINKS = "payment_links"
 PAYMENT_PROVIDERS = (PAYMENT_PROVIDER_DEMO, PAYMENT_PROVIDER_LINKS)
-PAYMENT_LINK_ENV_BY_PLAN = {
-    "starter": "PAYMENT_LINK_START",
-    "pro": "PAYMENT_LINK_GROWTH",
-    "agency": "PAYMENT_LINK_SCALE",
+PAYMENT_LINK_ENV_BY_PLAN: dict[str, tuple[str, ...]] = {
+    "starter": ("PAYMENT_LINK_STARTER", "PAYMENT_LINK_START"),
+    "growth": ("PAYMENT_LINK_GROWTH",),
+    "pro": ("PAYMENT_LINK_PRO",),
+    "agency": ("PAYMENT_LINK_AGENCY", "PAYMENT_LINK_BUSINESS", "PAYMENT_LINK_SCALE"),
 }
 
 
@@ -31,6 +32,9 @@ class Plan:
     plan_id: str
     title: str
     monthly_price_rub: int
+    price_rub_display: str
+    price_usdt_display: str
+    description: str
     limits: dict[str, int]
     features: list[str]
 
@@ -38,21 +42,38 @@ class Plan:
 PLANS: dict[str, Plan] = {
     "starter": Plan(
         plan_id="starter",
-        title="Start",
-        monthly_price_rub=990,
+        title="Starter",
+        monthly_price_rub=2490,
+        price_rub_display="2 490–3 490 ₽ / мес",
+        price_usdt_display="29–39 USDT / мес",
+        description=(
+            "Быстрый старт для 1 проекта: запускайте аудит, собирайте понятный план правок "
+            "и показывайте клиенту измеримый прогресс."
+        ),
         limits={
-            ACTION_URL_AUDIT: 30,
-            ACTION_TEXT_AUDIT: 60,
-            ACTION_AI: 40,
-            ACTION_EXPORT: 100,
-            ACTION_COMPETITORS: 20,
+            ACTION_URL_AUDIT: 80,
+            ACTION_TEXT_AUDIT: 150,
+            ACTION_AI: 80,
+            ACTION_EXPORT: 250,
+            ACTION_COMPETITORS: 40,
         },
-        features=["Аудит URL и текста", "Action Lab и приоритет проблем", "История изменений", "Экспорт PDF/JSON/MD"],
+        features=[
+            "Базовый SEO-аудит страниц и контента",
+            "Контент-календарь и простой план публикаций",
+            "Поддержка 1-2 соцсетей и отложенные публикации",
+            "Экспорт отчетов PDF/JSON/MD для клиента",
+        ],
     ),
-    "pro": Plan(
-        plan_id="pro",
+    "growth": Plan(
+        plan_id="growth",
         title="Growth",
-        monthly_price_rub=2990,
+        monthly_price_rub=6990,
+        price_rub_display="6 990–8 990 ₽ / мес",
+        price_usdt_display="79–99 USDT / мес",
+        description=(
+            "Основной рабочий тариф для малого бизнеса: больше лимитов, автоматизация контента "
+            "и регулярная отчетность без ручной рутины."
+        ),
         limits={
             ACTION_URL_AUDIT: 300,
             ACTION_TEXT_AUDIT: 600,
@@ -60,12 +81,47 @@ PLANS: dict[str, Plan] = {
             ACTION_EXPORT: 1500,
             ACTION_COMPETITORS: 300,
         },
-        features=["Все из Start", "Расширенный AI-блок", "Конкурентный анализ и query audit", "Webhook-интеграция"],
+        features=[
+            "Все из Starter",
+            "Автопостинг и AI-перепаковка контента",
+            "Еженедельные отчеты и расширенная аналитика",
+            "Больше лимитов по страницам, аудитам и публикациям",
+        ],
+    ),
+    "pro": Plan(
+        plan_id="pro",
+        title="Pro",
+        monthly_price_rub=14900,
+        price_rub_display="14 900–19 900 ₽ / мес",
+        price_usdt_display="169–229 USDT / мес",
+        description=(
+            "Для агентств и продвинутых команд: несколько брендов, white-label, "
+            "история изменений и масштабируемая аналитика."
+        ),
+        limits={
+            ACTION_URL_AUDIT: 1200,
+            ACTION_TEXT_AUDIT: 2500,
+            ACTION_AI: 1800,
+            ACTION_EXPORT: 5000,
+            ACTION_COMPETITORS: 1200,
+        },
+        features=[
+            "Все из Growth",
+            "White-label отчеты и история изменений",
+            "Прогнозирование через MiroFish",
+            "Командный доступ и расширенная аналитика под несколько брендов",
+        ],
     ),
     "agency": Plan(
         plan_id="agency",
-        title="Scale",
-        monthly_price_rub=8990,
+        title="Agency / Business",
+        monthly_price_rub=39900,
+        price_rub_display="39 900–69 900 ₽ / мес",
+        price_usdt_display="449–799 USDT / мес",
+        description=(
+            "Enterprise-режим для агентств и крупных команд: клиентские кабинеты, API, "
+            "кастомные лимиты и приоритетная поддержка."
+        ),
         limits={
             ACTION_URL_AUDIT: -1,
             ACTION_TEXT_AUDIT: -1,
@@ -73,7 +129,12 @@ PLANS: dict[str, Plan] = {
             ACTION_EXPORT: -1,
             ACTION_COMPETITORS: -1,
         },
-        features=["Безлимит на все действия", "White-label под клиента", "Приоритетный режим работы", "Подходит для агентства"],
+        features=[
+            "Клиентские кабинеты и роли доступа",
+            "API, webhooks и кастомные лимиты",
+            "Приоритетная поддержка и enterprise-интеграции",
+            "Безлимитная операционная работа команды",
+        ],
     ),
 }
 
@@ -95,14 +156,14 @@ def payment_provider_status(provider: str | None = None) -> dict[str, Any]:
     selected = _normalize_provider(provider)
     links: dict[str, str] = {}
     if selected == PAYMENT_PROVIDER_LINKS:
-        for plan_id, env_name in PAYMENT_LINK_ENV_BY_PLAN.items():
-            links[plan_id] = os.getenv(env_name, "").strip()
+        for plan_id, env_names in PAYMENT_LINK_ENV_BY_PLAN.items():
+            links[plan_id] = _resolve_plan_payment_link(env_names)
         missing = [plan_id for plan_id, url in links.items() if not url]
         configured = not missing
         if configured:
             message = "Платежные ссылки подключены."
         else:
-            names = ", ".join(PAYMENT_LINK_ENV_BY_PLAN[item] for item in missing)
+            names = ", ".join("/".join(PAYMENT_LINK_ENV_BY_PLAN[item]) for item in missing)
             message = f"Не хватает env-переменных для оплаты: {names}"
     else:
         configured = True
@@ -122,6 +183,14 @@ def payment_provider_status(provider: str | None = None) -> dict[str, Any]:
         "links": links,
         "manual_confirmation": manual_confirmation,
     }
+
+
+def _resolve_plan_payment_link(env_names: tuple[str, ...]) -> str:
+    for env_name in env_names:
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def init_billing_db(path: str | Path = DEFAULT_BILLING_DB) -> None:
@@ -221,6 +290,9 @@ def get_subscription(
         "limits": plan.limits,
         "features": plan.features,
         "price_rub": plan.monthly_price_rub,
+        "price_rub_display": plan.price_rub_display,
+        "price_usdt_display": plan.price_usdt_display,
+        "description": plan.description,
     }
 
 

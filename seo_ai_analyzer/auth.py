@@ -5,7 +5,7 @@ import hmac
 import re
 import secrets
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_AUTH_DB = Path('.seo_data/auth/users.db')
@@ -13,6 +13,7 @@ USERNAME_PATTERN = re.compile(r'^[A-Za-z0-9_.-]{3,32}$')
 CYRILLIC_PATTERN = re.compile(r'[А-Яа-яЁё]')
 EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
 PBKDF2_ITERATIONS = 120_000
+PERSISTENT_TOKEN_DAYS_DEFAULT = 30
 
 
 def init_auth_db(path: str | Path = DEFAULT_AUTH_DB) -> None:
@@ -25,6 +26,17 @@ def init_auth_db(path: str | Path = DEFAULT_AUTH_DB) -> None:
                 username TEXT PRIMARY KEY,
                 password_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            '''
+        )
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token_hash TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL
             )
             '''
         )
@@ -223,6 +235,120 @@ def change_user_password(
     return True, 'Пароль обновлен.'
 
 
+def create_persistent_login_token(
+    username: str,
+    days: int = PERSISTENT_TOKEN_DAYS_DEFAULT,
+    path: str | Path = DEFAULT_AUTH_DB,
+) -> str:
+    normalized = _normalize_username(username)
+    if not normalized:
+        return ''
+
+    db_path = Path(path)
+    init_auth_db(db_path)
+    token = secrets.token_urlsafe(32)
+    token_hash = _hash_token(token)
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=max(1, int(days)))
+
+    with sqlite3.connect(db_path) as conn:
+        user_exists = conn.execute(
+            'SELECT 1 FROM users WHERE username = ?',
+            (normalized,),
+        ).fetchone()
+        if not user_exists:
+            return ''
+
+        conn.execute(
+            'DELETE FROM auth_tokens WHERE username = ?',
+            (normalized,),
+        )
+        conn.execute(
+            '''
+            INSERT INTO auth_tokens (token_hash, username, expires_at, created_at, last_used_at)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            (
+                token_hash,
+                normalized,
+                expires_at.isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        conn.commit()
+    return token
+
+
+def resolve_persistent_login_token(
+    token: str,
+    path: str | Path = DEFAULT_AUTH_DB,
+) -> str | None:
+    raw_token = (token or '').strip()
+    if not raw_token:
+        return None
+
+    db_path = Path(path)
+    init_auth_db(db_path)
+    token_hash = _hash_token(raw_token)
+    now = datetime.now(timezone.utc)
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            'SELECT username, expires_at FROM auth_tokens WHERE token_hash = ?',
+            (token_hash,),
+        ).fetchone()
+        if not row:
+            return None
+
+        username = str(row[0])
+        expires_raw = str(row[1])
+        try:
+            expires_at = datetime.fromisoformat(expires_raw)
+        except ValueError:
+            conn.execute('DELETE FROM auth_tokens WHERE token_hash = ?', (token_hash,))
+            conn.commit()
+            return None
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= now:
+            conn.execute('DELETE FROM auth_tokens WHERE token_hash = ?', (token_hash,))
+            conn.commit()
+            return None
+
+        user_exists = conn.execute(
+            'SELECT 1 FROM users WHERE username = ?',
+            (username,),
+        ).fetchone()
+        if not user_exists:
+            conn.execute('DELETE FROM auth_tokens WHERE token_hash = ?', (token_hash,))
+            conn.commit()
+            return None
+
+        conn.execute(
+            'UPDATE auth_tokens SET last_used_at = ? WHERE token_hash = ?',
+            (now.isoformat(), token_hash),
+        )
+        conn.commit()
+    return username
+
+
+def revoke_persistent_login_token(
+    token: str,
+    path: str | Path = DEFAULT_AUTH_DB,
+) -> None:
+    raw_token = (token or '').strip()
+    if not raw_token:
+        return
+    db_path = Path(path)
+    init_auth_db(db_path)
+    token_hash = _hash_token(raw_token)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('DELETE FROM auth_tokens WHERE token_hash = ?', (token_hash,))
+        conn.commit()
+
+
 def _normalize_username(username: str) -> str:
     return (username or '').strip()
 
@@ -279,3 +405,7 @@ def _verify_password(password: str, encoded: str) -> bool:
         iterations,
     ).hex()
     return hmac.compare_digest(candidate, key_hex)
+
+
+def _hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()
