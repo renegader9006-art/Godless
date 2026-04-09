@@ -95,7 +95,6 @@ ACTION_LABELS = {
 }
 
 
-# -- helpers block --
 def parse_keywords(raw: str) -> list[str]:
     return [keyword.strip() for keyword in raw.split(",") if keyword.strip()]
 
@@ -1319,7 +1318,6 @@ def _page_label(page: str) -> str:
     return PAGE_LABELS.get(page, page)
 
 
-# -- render block --
 def render_app_header() -> None:
     return
 
